@@ -1,3 +1,4 @@
+
 name: CI Pipeline
 
 on:
@@ -23,3 +24,26 @@ jobs:
 
       - name: Check application syntax
         run: node --check app.js
+
+      - name: Build Docker image
+        run: docker build -t cicd-rollback-app:${{ github.sha }} .
+
+      - name: Run Docker container
+        run: |
+          docker run -d --name test-app -p 3000:3000 cicd-rollback-app:${{ github.sha }}
+
+      - name: Test application health
+        run: |
+          for i in {1..10}; do
+            if curl --fail http://localhost:3000/health; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Health check failed"
+          docker logs test-app
+          exit 1
+
+      - name: Stop test container
+        if: always()
+        run: docker rm -f test-app || true
