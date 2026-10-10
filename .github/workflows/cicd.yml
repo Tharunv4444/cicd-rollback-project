@@ -1,5 +1,5 @@
 
-name: CI Pipeline
+name: CI CD Pipeline
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
       - main
 
 jobs:
-  test:
+  test-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
@@ -26,11 +26,11 @@ jobs:
         run: node --check app.js
 
       - name: Build Docker image
-        run: docker build -t cicd-rollback-app:${{ github.sha }} .
+        run: docker build -t cicd-rollback-test:${{ github.sha }} .
 
-      - name: Run Docker container
+      - name: Run test container
         run: |
-          docker run -d --name test-app -p 3000:3000 cicd-rollback-app:${{ github.sha }}
+          docker run -d --name test-app -p 3000:3000 cicd-rollback-test:${{ github.sha }}
 
       - name: Test application health
         run: |
@@ -40,10 +40,112 @@ jobs:
             fi
             sleep 2
           done
-          echo "Health check failed"
           docker logs test-app
           exit 1
 
-      - name: Stop test container
+      - name: Clean up test container
         if: always()
         run: docker rm -f test-app || true
+
+      - name: Load SSH private key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.AZURE_VM_SSH_KEY }}
+
+      - name: Configure SSH verification
+        env:
+          KNOWN_HOSTS: ${{ secrets.AZURE_VM_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Copy application to Azure VM
+        env:
+          VM_HOST: ${{ secrets.AZURE_VM_HOST }}
+          VM_USER: ${{ secrets.AZURE_VM_USER }}
+        run: |
+          ssh -o StrictHostKeyChecking=yes "$VM_USER@$VM_HOST" \
+            'mkdir -p ~/cicd-rollback-project'
+
+          scp -o StrictHostKeyChecking=yes \
+            Dockerfile app.js package.json package-lock.json \
+            "$VM_USER@$VM_HOST:~/cicd-rollback-project/"
+
+      - name: Deploy and rollback
+        env:
+          VM_HOST: ${{ secrets.AZURE_VM_HOST }}
+          VM_USER: ${{ secrets.AZURE_VM_USER }}
+          RELEASE: ${{ github.sha }}
+        run: |
+          ssh -o StrictHostKeyChecking=yes "$VM_USER@$VM_HOST" \
+            "RELEASE='$RELEASE' bash -s" <<'REMOTE'
+          set -eu
+          cd ~/cicd-rollback-project
+
+          IMAGE="rollback-node-app:$RELEASE"
+          OLD_IMAGE="$(sudo docker inspect --format='{{.Config.Image}}' rollback-node-app 2>/dev/null || true)"
+
+          # Build and test the new version before replacing the old one.
+          sudo docker rm -f rollback-node-candidate >/dev/null 2>&1 || true
+          sudo docker build -t "$IMAGE" .
+          sudo docker run -d --name rollback-node-candidate -p 3001:3000 "$IMAGE"
+
+          healthy=0
+          for i in $(seq 1 10); do
+            if curl --fail http://localhost:3001/health; then
+              healthy=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$healthy" -ne 1 ]; then
+            sudo docker logs rollback-node-candidate || true
+            sudo docker rm -f rollback-node-candidate || true
+            echo "New version failed testing. Existing app was not replaced."
+            exit 1
+          fi
+
+          sudo docker rm -f rollback-node-candidate
+
+          # Replace the existing application.
+          if [ -n "$OLD_IMAGE" ]; then
+            sudo docker rm -f rollback-node-app
+          fi
+
+          if ! sudo docker run -d --name rollback-node-app -p 3000:3000 "$IMAGE"; then
+            sudo docker rm -f rollback-node-app || true
+            if [ -n "$OLD_IMAGE" ]; then
+              sudo docker run -d --name rollback-node-app -p 3000:3000 "$OLD_IMAGE"
+              echo "Previous image restored after startup failure."
+            fi
+            exit 1
+          fi
+
+          # Check the deployed version.
+          healthy=0
+          for i in $(seq 1 10); do
+            if curl --fail http://localhost:3000/health; then
+              healthy=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$healthy" -ne 1 ]; then
+            sudo docker logs rollback-node-app || true
+            sudo docker rm -f rollback-node-app || true
+
+            if [ -n "$OLD_IMAGE" ]; then
+              sudo docker run -d --name rollback-node-app -p 3000:3000 "$OLD_IMAGE"
+              echo "Previous version restored."
+            else
+              echo "No previous version exists to restore."
+            fi
+            exit 1
+          fi
+
+          echo "Deployment successful: $IMAGE"
+          REMOTE
