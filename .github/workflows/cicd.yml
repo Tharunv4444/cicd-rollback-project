@@ -87,7 +87,7 @@ jobs:
           IMAGE="rollback-node-app:$RELEASE"
           OLD_IMAGE="$(sudo docker inspect --format='{{.Config.Image}}' rollback-node-app 2>/dev/null || true)"
 
-          # Build and test the candidate before replacing the live app.
+          # Build and test candidate before replacing the live app.
           sudo docker rm -f rollback-node-candidate >/dev/null 2>&1 || true
           sudo docker build -t "$IMAGE" .
           sudo docker run -d --name rollback-node-candidate -p 3001:3000 "$IMAGE"
@@ -139,7 +139,7 @@ jobs:
             sleep 2
           done
 
-          # If the new version fails, restore and verify the previous version.
+          # Restore and verify the previous version if health check fails.
           if [ "$healthy" -ne 1 ]; then
             echo "Post-deployment health check failed."
             sudo docker logs rollback-node-app || true
@@ -175,10 +175,82 @@ jobs:
               exit 1
             fi
 
-            # Report deployment failure even when rollback succeeds.
+            # Mark the deployment as failed even if rollback succeeded.
             exit 1
           fi
 
           echo "Deployment successful: $IMAGE"
           REMOTE
 
+  rollback-simulation:
+    runs-on: ubuntu-latest
+    needs: test-and-deploy
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Build known-good image
+        run: docker build -t rollback-test:known-good .
+
+      - name: Start known-good application
+        run: |
+          docker run -d \
+            --name rollback-test-app \
+            -p 3002:3000 \
+            rollback-test:known-good
+
+      - name: Verify initial health
+        run: |
+          for i in {1..10}; do
+            if curl --fail http://localhost:3002/health; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs rollback-test-app
+          exit 1
+
+      - name: Simulate failed deployment
+        run: |
+          docker rm -f rollback-test-app
+          docker run -d \
+            --name rollback-test-app \
+            --entrypoint sh \
+            -p 3002:3000 \
+            rollback-test:known-good \
+            -c 'sleep 300'
+
+      - name: Confirm simulated failure
+        run: |
+          if curl --fail --max-time 3 http://localhost:3002/health; then
+            echo "ERROR: The simulated failure unexpectedly passed."
+            exit 1
+          else
+            echo "Expected failure detected."
+          fi
+
+      - name: Restore known-good version
+        if: always()
+        run: |
+          docker rm -f rollback-test-app || true
+          docker run -d \
+            --name rollback-test-app \
+            -p 3002:3000 \
+            rollback-test:known-good
+
+      - name: Verify recovery
+        run: |
+          for i in {1..10}; do
+            if curl --fail http://localhost:3002/health; then
+              echo "Recovery successful."
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs rollback-test-app
+          exit 1
+
+      - name: Clean up rollback test
+        if: always()
+        run: docker rm -f rollback-test-app || true
