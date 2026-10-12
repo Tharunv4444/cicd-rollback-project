@@ -87,7 +87,7 @@ jobs:
           IMAGE="rollback-node-app:$RELEASE"
           OLD_IMAGE="$(sudo docker inspect --format='{{.Config.Image}}' rollback-node-app 2>/dev/null || true)"
 
-          # Build and test candidate before replacing the live app.
+          # Build and test the candidate before replacing the live app.
           sudo docker rm -f rollback-node-candidate >/dev/null 2>&1 || true
           sudo docker build -t "$IMAGE" .
           sudo docker run -d --name rollback-node-candidate -p 3001:3000 "$IMAGE"
@@ -175,7 +175,7 @@ jobs:
               exit 1
             fi
 
-            # Mark the deployment as failed even if rollback succeeded.
+            # Mark deployment as failed even if rollback succeeded.
             exit 1
           fi
 
@@ -254,3 +254,93 @@ jobs:
       - name: Clean up rollback test
         if: always()
         run: docker rm -f rollback-test-app || true
+
+  azure-rollback-integration-test:
+    runs-on: ubuntu-latest
+    needs: test-and-deploy
+
+    steps:
+      - name: Load SSH private key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.AZURE_VM_SSH_KEY }}
+
+      - name: Configure SSH verification
+        env:
+          KNOWN_HOSTS: ${{ secrets.AZURE_VM_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Test Azure rollback in isolation
+        env:
+          VM_HOST: ${{ secrets.AZURE_VM_HOST }}
+          VM_USER: ${{ secrets.AZURE_VM_USER }}
+        run: |
+          ssh -o StrictHostKeyChecking=yes "$VM_USER@$VM_HOST" 'bash -s' <<'REMOTE'
+          set -eu
+
+          NAME="rollback-integration-test"
+          PORT="3003"
+          GOOD_IMAGE="rollback-node-app:known-good-backup"
+
+          cleanup() {
+            sudo docker rm -f "$NAME" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          # Confirm the known-good image starts and responds.
+          cleanup
+          sudo docker run -d --name "$NAME" -p "$PORT:3000" "$GOOD_IMAGE"
+
+          healthy=0
+          for i in $(seq 1 10); do
+            if curl --fail "http://localhost:$PORT/health"; then
+              healthy=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$healthy" -ne 1 ]; then
+            sudo docker logs "$NAME" || true
+            echo "Initial known-good health check failed."
+            exit 1
+          fi
+
+          # Simulate a failed release on the isolated test port.
+          cleanup
+          sudo docker run -d --name "$NAME" \
+            --entrypoint sh -p "$PORT:3000" "$GOOD_IMAGE" \
+            -c 'sleep 300'
+
+          if curl --fail --max-time 3 "http://localhost:$PORT/health"; then
+            echo "ERROR: Simulated failure unexpectedly passed."
+            exit 1
+          fi
+
+          echo "Simulated failure detected."
+
+          # Restore the known-good image.
+          cleanup
+          sudo docker run -d --name "$NAME" -p "$PORT:3000" "$GOOD_IMAGE"
+
+          healthy=0
+          for i in $(seq 1 10); do
+            if curl --fail "http://localhost:$PORT/health"; then
+              healthy=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$healthy" -ne 1 ]; then
+            sudo docker logs "$NAME" || true
+            echo "Azure rollback integration test failed."
+            exit 1
+          fi
+
+          echo "Azure rollback integration test passed."
+          REMOTE
