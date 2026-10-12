@@ -87,7 +87,7 @@ jobs:
           IMAGE="rollback-node-app:$RELEASE"
           OLD_IMAGE="$(sudo docker inspect --format='{{.Config.Image}}' rollback-node-app 2>/dev/null || true)"
 
-          # Build and test the new version before replacing the old one.
+          # Build and test the candidate before replacing the live app.
           sudo docker rm -f rollback-node-candidate >/dev/null 2>&1 || true
           sudo docker build -t "$IMAGE" .
           sudo docker run -d --name rollback-node-candidate -p 3001:3000 "$IMAGE"
@@ -104,27 +104,32 @@ jobs:
           if [ "$healthy" -ne 1 ]; then
             sudo docker logs rollback-node-candidate || true
             sudo docker rm -f rollback-node-candidate || true
-            echo "New version failed testing. Existing app was not replaced."
+            echo "Candidate failed health check. Existing app was not replaced."
             exit 1
           fi
 
           sudo docker rm -f rollback-node-candidate
 
-          # Replace the existing application.
+          # Replace the live application.
           if [ -n "$OLD_IMAGE" ]; then
             sudo docker rm -f rollback-node-app
           fi
 
           if ! sudo docker run -d --name rollback-node-app -p 3000:3000 "$IMAGE"; then
             sudo docker rm -f rollback-node-app || true
+
             if [ -n "$OLD_IMAGE" ]; then
-              sudo docker run -d --name rollback-node-app -p 3000:3000 "$OLD_IMAGE"
-              echo "Previous image restored after startup failure."
+              if sudo docker run -d --name rollback-node-app -p 3000:3000 "$OLD_IMAGE"; then
+                echo "Previous image started after deployment startup failure."
+              else
+                echo "CRITICAL: Could not start the previous image."
+              fi
             fi
+
             exit 1
           fi
 
-          # Check the deployed version.
+          # Check the newly deployed application.
           healthy=0
           for i in $(seq 1 10); do
             if curl --fail http://localhost:3000/health; then
@@ -134,18 +139,46 @@ jobs:
             sleep 2
           done
 
+          # If the new version fails, restore and verify the previous version.
           if [ "$healthy" -ne 1 ]; then
+            echo "Post-deployment health check failed."
             sudo docker logs rollback-node-app || true
             sudo docker rm -f rollback-node-app || true
 
             if [ -n "$OLD_IMAGE" ]; then
-              sudo docker run -d --name rollback-node-app -p 3000:3000 "$OLD_IMAGE"
-              echo "Previous version restored."
+              echo "Attempting to restore previous version: $OLD_IMAGE"
+
+              if sudo docker run -d --name rollback-node-app -p 3000:3000 "$OLD_IMAGE"; then
+                rollback_healthy=0
+
+                for i in $(seq 1 10); do
+                  if curl --fail http://localhost:3000/health; then
+                    rollback_healthy=1
+                    break
+                  fi
+                  sleep 2
+                done
+
+                if [ "$rollback_healthy" -eq 1 ]; then
+                  echo "Rollback successful: previous version is healthy."
+                else
+                  echo "CRITICAL: Previous version failed its health check."
+                  sudo docker logs rollback-node-app || true
+                  exit 1
+                fi
+              else
+                echo "CRITICAL: Failed to start previous version."
+                exit 1
+              fi
             else
-              echo "No previous version exists to restore."
+              echo "CRITICAL: No previous version exists to restore."
+              exit 1
             fi
+
+            # Report deployment failure even when rollback succeeds.
             exit 1
           fi
 
           echo "Deployment successful: $IMAGE"
           REMOTE
+
