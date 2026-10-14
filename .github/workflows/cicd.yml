@@ -5,19 +5,24 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout source code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 18
+          node-version: '18'
+          cache: npm
 
       - name: Install dependencies
         run: npm ci
@@ -26,26 +31,28 @@ jobs:
         run: node --check app.js
 
       - name: Build Docker image
-        run: docker build -t cicd-rollback-test:${{ github.sha }} .
+        run: docker build -t "cicd-rollback-app:${GITHUB_SHA}" .
 
-      - name: Run test container
+      - name: Test application container
         run: |
-          docker run -d --name test-app -p 3000:3000 cicd-rollback-test:${{ github.sha }}
+          set -e
+          docker rm -f test-app || true
+          docker run -d --name test-app \
+            -p 3000:3000 \
+            "cicd-rollback-app:${GITHUB_SHA}"
 
-      - name: Test application health
-        run: |
           for i in {1..10}; do
             if curl --fail http://localhost:3000/health; then
+              echo "Application health check passed."
+              docker rm -f test-app
               exit 0
             fi
             sleep 2
           done
-          docker logs test-app
-          exit 1
 
-      - name: Clean up test container
-        if: always()
-        run: docker rm -f test-app || true
+          docker logs test-app
+          docker rm -f test-app || true
+          exit 1
 
       - name: Load SSH private key
         uses: webfactory/ssh-agent@v0.9.0
@@ -77,31 +84,27 @@ jobs:
             scripts/deploy-and-rollback.sh \
             "$VM_USER@$VM_HOST:~/cicd-rollback-project/scripts/"
 
-      - name: Deploy and rollback
+      - name: Deploy with automatic rollback
         env:
           VM_HOST: ${{ secrets.AZURE_VM_HOST }}
           VM_USER: ${{ secrets.AZURE_VM_USER }}
           RELEASE: ${{ github.sha }}
         run: |
           ssh -o StrictHostKeyChecking=yes "$VM_USER@$VM_HOST" \
-            "RELEASE='$RELEASE' bash -s" <<'REMOTE'
-          set -eu
-          cd ~/cicd-rollback-project
-
-          bash scripts/deploy-and-rollback.sh \
-            "rollback-node-app:$RELEASE" \
-            "rollback-node-app" \
-            "3000" \
-            "3001" \
-            "false"
-          REMOTE
+            "cd ~/cicd-rollback-project && \
+            bash scripts/deploy-and-rollback.sh \
+            'rollback-node-app:${RELEASE}' \
+            'rollback-node-app' \
+            '3000' \
+            '3001' \
+            'false'"
 
   rollback-simulation:
     runs-on: ubuntu-latest
     needs: test-and-deploy
 
     steps:
-      - name: Checkout source code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Build known-good image
@@ -109,47 +112,43 @@ jobs:
 
       - name: Start known-good application
         run: |
-          docker run -d \
-            --name rollback-test-app \
-            -p 3002:3000 \
-            rollback-test:known-good
+          docker run -d --name rollback-test-app \
+            -p 3002:3000 rollback-test:known-good
 
-      - name: Verify initial health
-        run: |
           for i in {1..10}; do
             if curl --fail http://localhost:3002/health; then
+              echo "Known-good application is healthy."
               exit 0
             fi
             sleep 2
           done
+
           docker logs rollback-test-app
           exit 1
 
-      - name: Simulate failed deployment
+      - name: Simulate deployment failure
         run: |
           docker rm -f rollback-test-app
-          docker run -d \
-            --name rollback-test-app \
+
+          docker run -d --name rollback-test-app \
             --entrypoint sh \
             -p 3002:3000 \
             rollback-test:known-good \
             -c 'sleep 300'
 
-      - name: Confirm simulated failure
-        run: |
-          if curl --fail --max-time 3 http://localhost:3002/health; then
-            echo "ERROR: The simulated failure unexpectedly passed."
+          if curl --fail --max-time 3 \
+            http://localhost:3002/health; then
+            echo "Unexpected healthy response."
             exit 1
-          else
-            echo "Expected failure detected."
           fi
+
+          echo "Simulated deployment failure detected."
 
       - name: Restore known-good version
         if: always()
         run: |
           docker rm -f rollback-test-app || true
-          docker run -d \
-            --name rollback-test-app \
+          docker run -d --name rollback-test-app \
             -p 3002:3000 \
             rollback-test:known-good
 
@@ -162,6 +161,7 @@ jobs:
             fi
             sleep 2
           done
+
           docker logs rollback-test-app
           exit 1
 
@@ -174,6 +174,9 @@ jobs:
     needs: test-and-deploy
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Load SSH private key
         uses: webfactory/ssh-agent@v0.9.0
         with:
@@ -188,13 +191,17 @@ jobs:
           printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
-      - name: Copy deployment script to Azure VM
+      - name: Copy application and deployment script to Azure VM
         env:
           VM_HOST: ${{ secrets.AZURE_VM_HOST }}
           VM_USER: ${{ secrets.AZURE_VM_USER }}
         run: |
           ssh -o StrictHostKeyChecking=yes "$VM_USER@$VM_HOST" \
             'mkdir -p ~/cicd-rollback-project/scripts'
+
+          scp -o StrictHostKeyChecking=yes \
+            Dockerfile app.js package.json package-lock.json \
+            "$VM_USER@$VM_HOST:~/cicd-rollback-project/"
 
           scp -o StrictHostKeyChecking=yes \
             scripts/deploy-and-rollback.sh \
@@ -204,15 +211,16 @@ jobs:
         env:
           VM_HOST: ${{ secrets.AZURE_VM_HOST }}
           VM_USER: ${{ secrets.AZURE_VM_USER }}
+          RELEASE: ${{ github.sha }}
         run: |
-          ssh -o StrictHostKeyChecking=yes "$VM_USER@$VM_HOST" 'bash -s' <<'REMOTE'
-          set -eu
-          cd ~/cicd-rollback-project
+          ssh -o StrictHostKeyChecking=yes "$VM_USER@$VM_HOST" \
+            "cd ~/cicd-rollback-project && bash -s -- '${RELEASE}'" <<'REMOTE'
+          set -Eeuo pipefail
 
+          IMAGE="rollback-integration-test:$1"
           NAME="rollback-integration-test"
           PORT="3003"
           CANDIDATE_PORT="3004"
-          IMAGE="rollback-integration-test:known-good"
 
           cleanup() {
             sudo docker rm -f "$NAME" "${NAME}-candidate" \
@@ -220,13 +228,13 @@ jobs:
           }
           trap cleanup EXIT
 
-          # Build a test image from the current application.
-          sudo docker build -t "$IMAGE" .
+          # Create a known-good release for the isolated test.
+          sudo docker build -t rollback-integration-test:known-good .
 
-          # Start a known-good container on the isolated test port.
           cleanup
           sudo docker run -d --name "$NAME" \
-            -p "$PORT:3000" "$IMAGE"
+            -p "$PORT:3000" \
+            rollback-integration-test:known-good
 
           healthy=0
           for i in $(seq 1 10); do
@@ -239,32 +247,37 @@ jobs:
 
           if [ "$healthy" -ne 1 ]; then
             sudo docker logs "$NAME" || true
-            echo "Initial test application is unhealthy."
+            echo "Known-good test application failed to start."
             exit 1
           fi
 
-          # Run the shared deployment script in simulation mode.
-          # It will capture the previous image, pass candidate
-          # health checks, simulate a failed replacement, and roll back.
+          # The script intentionally returns exit code 1 after
+          # a simulated deployment failure and successful rollback.
           set +e
           bash scripts/deploy-and-rollback.sh \
             "$IMAGE" "$NAME" "$PORT" "$CANDIDATE_PORT" "true"
           result=$?
           set -e
 
-          # A simulated failed deployment must return failure,
-          # even when rollback succeeds.
-          if [ "$result" -eq 0 ]; then
-            echo "ERROR: Simulated deployment unexpectedly succeeded."
+          if [ "$result" -ne 1 ]; then
+            echo "Expected exit code 1 after simulated failure and rollback; got $result."
             exit 1
           fi
 
-          # Confirm the rollback restored a healthy application.
-          if ! curl --fail --max-time 5 "http://localhost:$PORT/health"; then
+          healthy=0
+          for i in $(seq 1 10); do
+            if curl --fail "http://localhost:$PORT/health"; then
+              healthy=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$healthy" -ne 1 ]; then
+            echo "Rollback recovery verification failed."
             sudo docker logs "$NAME" || true
-            echo "ERROR: Application was not healthy after rollback."
             exit 1
           fi
 
-          echo "Actual rollback function executed and recovery verified."
+          echo "Integration test passed: failed deployment detected and previous release restored."
           REMOTE
