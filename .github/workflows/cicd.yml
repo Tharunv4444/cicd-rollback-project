@@ -61,17 +61,21 @@ jobs:
           printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
-      - name: Copy application to Azure VM
+      - name: Copy application and deployment script to Azure VM
         env:
           VM_HOST: ${{ secrets.AZURE_VM_HOST }}
           VM_USER: ${{ secrets.AZURE_VM_USER }}
         run: |
           ssh -o StrictHostKeyChecking=yes "$VM_USER@$VM_HOST" \
-            'mkdir -p ~/cicd-rollback-project'
+            'mkdir -p ~/cicd-rollback-project/scripts'
 
           scp -o StrictHostKeyChecking=yes \
             Dockerfile app.js package.json package-lock.json \
             "$VM_USER@$VM_HOST:~/cicd-rollback-project/"
+
+          scp -o StrictHostKeyChecking=yes \
+            scripts/deploy-and-rollback.sh \
+            "$VM_USER@$VM_HOST:~/cicd-rollback-project/scripts/"
 
       - name: Deploy and rollback
         env:
@@ -84,102 +88,12 @@ jobs:
           set -eu
           cd ~/cicd-rollback-project
 
-          IMAGE="rollback-node-app:$RELEASE"
-          OLD_IMAGE="$(sudo docker inspect --format='{{.Config.Image}}' rollback-node-app 2>/dev/null || true)"
-
-          # Build and test the candidate before replacing the live app.
-          sudo docker rm -f rollback-node-candidate >/dev/null 2>&1 || true
-          sudo docker build -t "$IMAGE" .
-          sudo docker run -d --name rollback-node-candidate -p 3001:3000 "$IMAGE"
-
-          healthy=0
-          for i in $(seq 1 10); do
-            if curl --fail http://localhost:3001/health; then
-              healthy=1
-              break
-            fi
-            sleep 2
-          done
-
-          if [ "$healthy" -ne 1 ]; then
-            sudo docker logs rollback-node-candidate || true
-            sudo docker rm -f rollback-node-candidate || true
-            echo "Candidate failed health check. Existing app was not replaced."
-            exit 1
-          fi
-
-          sudo docker rm -f rollback-node-candidate
-
-          # Replace the live application.
-          if [ -n "$OLD_IMAGE" ]; then
-            sudo docker rm -f rollback-node-app
-          fi
-
-          if ! sudo docker run -d --name rollback-node-app -p 3000:3000 "$IMAGE"; then
-            sudo docker rm -f rollback-node-app || true
-
-            if [ -n "$OLD_IMAGE" ]; then
-              if sudo docker run -d --name rollback-node-app -p 3000:3000 "$OLD_IMAGE"; then
-                echo "Previous image started after deployment startup failure."
-              else
-                echo "CRITICAL: Could not start the previous image."
-              fi
-            fi
-
-            exit 1
-          fi
-
-          # Check the newly deployed application.
-          healthy=0
-          for i in $(seq 1 10); do
-            if curl --fail http://localhost:3000/health; then
-              healthy=1
-              break
-            fi
-            sleep 2
-          done
-
-          # Restore and verify the previous version if health check fails.
-          if [ "$healthy" -ne 1 ]; then
-            echo "Post-deployment health check failed."
-            sudo docker logs rollback-node-app || true
-            sudo docker rm -f rollback-node-app || true
-
-            if [ -n "$OLD_IMAGE" ]; then
-              echo "Attempting to restore previous version: $OLD_IMAGE"
-
-              if sudo docker run -d --name rollback-node-app -p 3000:3000 "$OLD_IMAGE"; then
-                rollback_healthy=0
-
-                for i in $(seq 1 10); do
-                  if curl --fail http://localhost:3000/health; then
-                    rollback_healthy=1
-                    break
-                  fi
-                  sleep 2
-                done
-
-                if [ "$rollback_healthy" -eq 1 ]; then
-                  echo "Rollback successful: previous version is healthy."
-                else
-                  echo "CRITICAL: Previous version failed its health check."
-                  sudo docker logs rollback-node-app || true
-                  exit 1
-                fi
-              else
-                echo "CRITICAL: Failed to start previous version."
-                exit 1
-              fi
-            else
-              echo "CRITICAL: No previous version exists to restore."
-              exit 1
-            fi
-
-            # Mark deployment as failed even if rollback succeeded.
-            exit 1
-          fi
-
-          echo "Deployment successful: $IMAGE"
+          bash scripts/deploy-and-rollback.sh \
+            "rollback-node-app:$RELEASE" \
+            "rollback-node-app" \
+            "3000" \
+            "3001" \
+            "false"
           REMOTE
 
   rollback-simulation:
@@ -274,58 +188,45 @@ jobs:
           printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
-      - name: Test Azure rollback in isolation
+      - name: Copy deployment script to Azure VM
+        env:
+          VM_HOST: ${{ secrets.AZURE_VM_HOST }}
+          VM_USER: ${{ secrets.AZURE_VM_USER }}
+        run: |
+          ssh -o StrictHostKeyChecking=yes "$VM_USER@$VM_HOST" \
+            'mkdir -p ~/cicd-rollback-project/scripts'
+
+          scp -o StrictHostKeyChecking=yes \
+            scripts/deploy-and-rollback.sh \
+            "$VM_USER@$VM_HOST:~/cicd-rollback-project/scripts/"
+
+      - name: Test actual rollback logic on isolated port
         env:
           VM_HOST: ${{ secrets.AZURE_VM_HOST }}
           VM_USER: ${{ secrets.AZURE_VM_USER }}
         run: |
           ssh -o StrictHostKeyChecking=yes "$VM_USER@$VM_HOST" 'bash -s' <<'REMOTE'
           set -eu
+          cd ~/cicd-rollback-project
 
           NAME="rollback-integration-test"
           PORT="3003"
-          GOOD_IMAGE="rollback-node-app:known-good-backup"
+          CANDIDATE_PORT="3004"
+          IMAGE="rollback-integration-test:known-good"
 
           cleanup() {
-            sudo docker rm -f "$NAME" >/dev/null 2>&1 || true
+            sudo docker rm -f "$NAME" "${NAME}-candidate" \
+              >/dev/null 2>&1 || true
           }
           trap cleanup EXIT
 
-          # Confirm the known-good image starts and responds.
-          cleanup
-          sudo docker run -d --name "$NAME" -p "$PORT:3000" "$GOOD_IMAGE"
+          # Build a test image from the current application.
+          sudo docker build -t "$IMAGE" .
 
-          healthy=0
-          for i in $(seq 1 10); do
-            if curl --fail "http://localhost:$PORT/health"; then
-              healthy=1
-              break
-            fi
-            sleep 2
-          done
-
-          if [ "$healthy" -ne 1 ]; then
-            sudo docker logs "$NAME" || true
-            echo "Initial known-good health check failed."
-            exit 1
-          fi
-
-          # Simulate a failed release on the isolated test port.
+          # Start a known-good container on the isolated test port.
           cleanup
           sudo docker run -d --name "$NAME" \
-            --entrypoint sh -p "$PORT:3000" "$GOOD_IMAGE" \
-            -c 'sleep 300'
-
-          if curl --fail --max-time 3 "http://localhost:$PORT/health"; then
-            echo "ERROR: Simulated failure unexpectedly passed."
-            exit 1
-          fi
-
-          echo "Simulated failure detected."
-
-          # Restore the known-good image.
-          cleanup
-          sudo docker run -d --name "$NAME" -p "$PORT:3000" "$GOOD_IMAGE"
+            -p "$PORT:3000" "$IMAGE"
 
           healthy=0
           for i in $(seq 1 10); do
@@ -338,9 +239,32 @@ jobs:
 
           if [ "$healthy" -ne 1 ]; then
             sudo docker logs "$NAME" || true
-            echo "Azure rollback integration test failed."
+            echo "Initial test application is unhealthy."
             exit 1
           fi
 
-          echo "Azure rollback integration test passed."
+          # Run the shared deployment script in simulation mode.
+          # It will capture the previous image, pass candidate
+          # health checks, simulate a failed replacement, and roll back.
+          set +e
+          bash scripts/deploy-and-rollback.sh \
+            "$IMAGE" "$NAME" "$PORT" "$CANDIDATE_PORT" "true"
+          result=$?
+          set -e
+
+          # A simulated failed deployment must return failure,
+          # even when rollback succeeds.
+          if [ "$result" -eq 0 ]; then
+            echo "ERROR: Simulated deployment unexpectedly succeeded."
+            exit 1
+          fi
+
+          # Confirm the rollback restored a healthy application.
+          if ! curl --fail --max-time 5 "http://localhost:$PORT/health"; then
+            sudo docker logs "$NAME" || true
+            echo "ERROR: Application was not healthy after rollback."
+            exit 1
+          fi
+
+          echo "Actual rollback function executed and recovery verified."
           REMOTE
